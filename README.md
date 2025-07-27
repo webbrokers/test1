@@ -16,3 +16,17 @@ To publish this site on GitHub Pages:
 4. After the workflow completes, your site will be available at `https://<your-username>.github.io/<repository>`.
 
 Once configured, any changes pushed to `main` will update the published site automatically.
+
+## Pushing to GitHub
+
+If this is a brand new repository, commit the files and push them to GitHub:
+
+```bash
+git init
+git add .
+git commit -m "Initial site"
+
+git remote add origin <your-repo-url>
+git branch -M main
+git push -u origin main
+```
