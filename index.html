@@ -1,0 +1,217 @@
+<!doctype html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Multidimensional Scoring Sandbox</title>
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>html,body,#root{height:100%;background:#0B1220}</style>
+</head>
+<body class="text-slate-100">
+  <div id="root"></div>
+  <script>
+  // ==== Constants ====
+  const KEYSEP = "||"; // dims join + values join
+  const VALSEP = "|";  // value pair sep inside key
+  const pageSize = 50;
+
+  // --- Utility helpers ---
+  function mulberry32(a){return function(){let t=(a+=0x6d2b79f5);t=Math.imul(t^(t>>>15),t|1);t^=t+Math.imul(t^(t>>>7),t|61);return((t^(t>>>14))>>>0)/4294967296}};
+
+  function downloadCSV(filename, rows){
+    const process=(v)=> typeof v==="string"? '"'+v.replaceAll('"','""')+'"' : (v ?? "");
+    const csv = rows.map(r=> r.map(process).join(",")).join("\n");
+    const blob = new Blob(["\uFEFF"+csv], {type:"text/csv;charset=utf-8;", endings:"native"});
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = filename; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+  }
+
+  function combinations(arr, minK, maxK){
+    const res=[]; const n=arr.length;
+    (function backtrack(start, combo){
+      if(combo.length>=minK && combo.length<=maxK) res.push(combo.slice());
+      if(combo.length===maxK) return;
+      for(let i=start;i<n;i++){combo.push(arr[i]); backtrack(i+1, combo); combo.pop();}
+    })(0,[]); return res;
+  }
+
+  const DEFAULTS = {
+    sampleSize: 10000,
+    seed: 12345,
+    age: { from: 18, to: 65, bucket: 5 },
+    gender: ["male","female"],
+    rating: { from: 100, to: 200, step: 10 },
+    limit: { from: 1000, to: 10000, step: 1000 },
+    antifraud: { from: 0, to: 1, step: 0.1 },
+    cities: ["Москва","Санкт-Петербург","Новосибирск","Екатеринбург","Казань","Нижний Новгород","Челябинск","Самара","Омск","Ростов-на-Дону"],
+    baseBadRate: 0.15,
+  };
+
+  function buildBucketsAge({from,to,bucket}){const buckets=[]; let start=from; while(start<=to){const end=Math.min(start+bucket-1,to); buckets.push({start,end,label:`${start}-${end}`}); start=end+1;} return buckets;}
+  function range(from,to,step){const arr=[]; const n=Math.floor((to-from)/step+1e-9); for(let i=0;i<=n;i++){const v=from+i*step; arr.push(Number(v.toFixed(10)));} return arr;}
+
+  function defaultOutcomeProbability(row,cfg){
+    let p = cfg.baseBadRate; const aFrom = Number(String(row.age).split('-')[0]);
+    if(aFrom<23) p+=0.06; if(row.gender==='male') p+=0.015;
+    p += (130 - Math.min(Number(row.rating),130))*0.001;
+    p += row.antifraud<0.3?0.07: row.antifraud<0.6?0.03: -0.02;
+    p += row.limit>7000?0.02:0; return Math.max(0.01, Math.min(0.95, p));
+  }
+
+  function makeGenerator(cfg){
+    const rng = mulberry32(cfg.seed||1);
+    const ageBuckets = buildBucketsAge(cfg.age);
+    const genders=cfg.gender; const ratings=range(cfg.rating.from,cfg.rating.to,cfg.rating.step);
+    const limits=range(cfg.limit.from,cfg.limit.to,cfg.limit.step); const antifrauds=range(cfg.antifraud.from,cfg.antifraud.to,cfg.antifraud.step);
+    const cities=cfg.cities; const outcomeFn = cfg.outcomeFn || defaultOutcomeProbability;
+
+    function draw(arr){const i=Math.floor(rng()*arr.length); return arr[Math.min(i,arr.length-1)];}
+    const variables=[{key:'age',values:ageBuckets.map(b=>b.label)},{key:'gender',values:genders},{key:'rating',values:ratings},{key:'limit',values:limits},{key:'antifraud',values:antifrauds},{key:'city',values:cities}];
+    const samples=[]; for(let i=0;i<cfg.sampleSize;i++){const row={age:draw(ageBuckets).label, gender:draw(genders), rating:draw(ratings), limit:draw(limits), antifraud:draw(antifrauds), city:draw(cities)}; const p=outcomeFn(row,cfg); row.outcome = rng()<p?1:0; samples.push(row);} return {variables,samples};
+  }
+
+  function computeSegments(samples, combos){
+    const idx=new Map();
+    for(const s of samples){ for(const combo of combos){ const keyParts = combo.map(k=> `${k}=${s[k]}`); const k = combo.join('+')+KEYSEP+keyParts.join(VALSEP); const rec = idx.get(k) || {count:0,bad:0}; rec.count++; rec.bad += s.outcome===1?1:0; idx.set(k,rec);} }
+    const rows=[]; for(const [k,rec] of idx.entries()){ const [dimsStr, valuesStr] = k.split(KEYSEP); rows.push({dims:dimsStr, values:valuesStr.replaceAll(VALSEP,','), count:rec.count, bad:rec.bad, bad_rate:Number((rec.bad/rec.count).toFixed(4))}); }
+    rows.sort((a,b)=> b.bad_rate - a.bad_rate || b.count - a.count); return rows;
+  }
+
+  function App(){
+    const {useMemo, useState} = React;
+    const [cfg,setCfg] = useState(DEFAULTS);
+    const [data,setData] = useState([]);
+    const [segments,setSegments] = useState([]);
+    const [minK,setMinK] = useState(3);
+    const [maxK,setMaxK] = useState(6);
+    const [query,setQuery] = useState("");
+    const [page,setPage] = useState(1);
+
+    const varsOrder=["age","gender","rating","limit","antifraud","city"];
+    const combos = useMemo(()=>{ const kMin=Math.max(1, Math.min(minK, varsOrder.length)); const kMax=Math.max(kMin, Math.min(maxK, varsOrder.length)); return combinations(varsOrder,kMin,kMax); }, [minK,maxK]);
+
+    const filtered = useMemo(()=>{ if(!segments.length||!query) return segments; const q=query.toLowerCase(); return segments.filter(r=> r.dims.toLowerCase().includes(q)||r.values.toLowerCase().includes(q)); }, [segments,query]);
+    const paged = useMemo(()=>{ const start=(page-1)*pageSize; return filtered.slice(start,start+pageSize); }, [filtered,page]);
+
+    function generate(){ const {samples} = makeGenerator(cfg); setData(samples); setSegments([]); setPage(1);} 
+    function compute(){ if(!data.length) return; const rows = computeSegments(data, combos); setSegments(rows); setPage(1);} 
+    function exportCSV(){ const header=["dims","values","count","bad","bad_rate"]; const rows=[header, ...filtered.map(r=> header.map(h=> r[h]))]; downloadCSV("segments.csv", rows);} 
+
+    return React.createElement('div',{className:'min-h-screen w-full p-6'},
+      React.createElement('div',{className:'max-w-7xl mx-auto grid grid-cols-1 gap-6'},
+        React.createElement('h1',{className:'text-3xl font-bold'},'Multidimensional Scoring Sandbox'),
+        React.createElement('div',{className:'grid md:grid-cols-3 gap-4'},
+          // Генерация
+          React.createElement('div',{className:'p-4 rounded-2xl bg-slate-900 border border-slate-800'},
+            React.createElement('div',{className:'flex items-center gap-2 mb-3'},
+              React.createElement('div',{className:'w-2 h-2 rounded-full bg-indigo-400'}),
+              React.createElement('h2',{className:'font-semibold'},'Параметры генерации')
+            ),
+            React.createElement('div',{className:'grid grid-cols-2 gap-3 text-sm'},
+              React.createElement('label',{className:'col-span-1'},'Sample size',
+                React.createElement('input',{type:'number', min:100, max:200000, value:cfg.sampleSize, onChange:e=>setCfg({...cfg, sampleSize:Number(e.target.value)}), className:'mt-1 w-full bg-slate-800 rounded px-2 py-1'})
+              ),
+              React.createElement('label',{className:'col-span-1'},'Seed',
+                React.createElement('input',{type:'number', value:cfg.seed, onChange:e=>setCfg({...cfg, seed:Number(e.target.value)}), className:'mt-1 w-full bg-slate-800 rounded px-2 py-1'})
+              ),
+              React.createElement('label',{className:'col-span-1'},'Age bucket (yrs)',
+                React.createElement('input',{type:'number', min:2, max:15, value:cfg.age.bucket, onChange:e=>setCfg({...cfg, age:{...cfg.age, bucket:Number(e.target.value)}}), className:'mt-1 w-full bg-slate-800 rounded px-2 py-1'})
+              ),
+              React.createElement('label',{className:'col-span-1'},'Base bad rate',
+                React.createElement('input',{type:'number', step:'0.01', min:0.01, max:0.9, value:cfg.baseBadRate, onChange:e=>setCfg({...cfg, baseBadRate:Number(e.target.value)}), className:'mt-1 w-full bg-slate-800 rounded px-2 py-1'})
+              )
+            ),
+            React.createElement('div',{className:'mt-3 flex gap-2'},
+              React.createElement('button',{onClick:generate, className:'inline-flex items-center gap-2 px-3 py-2 rounded-2xl bg-indigo-600 hover:bg-indigo-500'}, 'Сгенерировать данные'),
+              React.createElement('button',{onClick:()=>setCfg(DEFAULTS), className:'inline-flex items-center gap-2 px-3 py-2 rounded-2xl bg-slate-800 hover:bg-slate-700'}, 'Сброс')
+            )
+          ),
+          // Комбо
+          React.createElement('div',{className:'p-4 rounded-2xl bg-slate-900 border border-slate-800'},
+            React.createElement('div',{className:'flex items-center gap-2 mb-3'},
+              React.createElement('div',{className:'w-2 h-2 rounded-full bg-emerald-400'}),
+              React.createElement('h2',{className:'font-semibold'},'Комбинации сегментов')
+            ),
+            React.createElement('div',{className:'grid grid-cols-2 gap-3 text-sm'},
+              React.createElement('label',null,'Min dims (K)',
+                React.createElement('input',{type:'number', min:1, max:6, value:minK, onChange:e=>setMinK(Number(e.target.value)), className:'mt-1 w-full bg-slate-800 rounded px-2 py-1'})
+              ),
+              React.createElement('label',null,'Max dims (K)',
+                React.createElement('input',{type:'number', min:1, max:6, value:maxK, onChange:e=>setMaxK(Number(e.target.value)), className:'mt-1 w-full bg-slate-800 rounded px-2 py-1'})
+              )
+            ),
+            React.createElement('div',{className:'mt-3 flex gap-2'},
+              React.createElement('button',{disabled:!data.length, onClick:compute, className:'inline-flex items-center gap-2 px-3 py-2 rounded-2xl bg-emerald-600 disabled:opacity-40 hover:bg-emerald-500'}, 'Посчитать сегменты')
+            ),
+            React.createElement('div',{className:'mt-3 grid grid-cols-3 gap-2 text-sm'},
+              React.createElement('div',{className:'px-3 py-2 rounded-2xl bg-slate-800/60 border border-slate-700'},
+                React.createElement('span',{className:'opacity-70 mr-2'},'Наблюдений'), React.createElement('span',{className:'font-semibold'}, String(data.length))
+              ),
+              React.createElement('div',{className:'px-3 py-2 rounded-2xl bg-slate-800/60 border border-slate-700'},
+                React.createElement('span',{className:'opacity-70 mr-2'},'Сегментов'), React.createElement('span',{className:'font-semibold'}, String(segments.length))
+              ),
+              React.createElement('div',{className:'px-3 py-2 rounded-2xl bg-slate-800/60 border border-slate-700'},
+                React.createElement('span',{className:'opacity-70 mr-2'},'Комбо K'), React.createElement('span',{className:'font-semibold'}, `${minK}-${maxK}`)
+              )
+            )
+          ),
+          // Экспорт/поиск
+          React.createElement('div',{className:'p-4 rounded-2xl bg-slate-900 border border-slate-800'},
+            React.createElement('div',{className:'flex items-center gap-2 mb-3'},
+              React.createElement('div',{className:'w-2 h-2 rounded-full bg-sky-400'}),
+              React.createElement('h2',{className:'font-semibold'},'Экспорт и поиск')
+            ),
+            React.createElement('input',{value:query, onChange:e=>{setQuery(e.target.value); setPage(1);}, placeholder:'Поиск по dims/values...', className:'w-full bg-slate-800 rounded px-3 py-2 text-sm'}),
+            React.createElement('div',{className:'mt-3 flex gap-2'},
+              React.createElement('button',{disabled:!segments.length, onClick:exportCSV, className:'inline-flex items-center gap-2 px-3 py-2 rounded-2xl bg-sky-600 disabled:opacity-40 hover:bg-sky-500'}, 'Экспорт CSV')
+            )
+          )
+        ),
+        // Таблица
+        React.createElement('div',{className:'rounded-2xl overflow-hidden border border-slate-800 bg-slate-900'},
+          React.createElement('div',{className:'overflow-auto max-h-[60vh]'},
+            React.createElement('table',{className:'min-w-full text-sm'},
+              React.createElement('thead',{className:'bg-slate-800 sticky top-0 z-10'},
+                React.createElement('tr',null,
+                  React.createElement('th',{className:'px-3 py-2 text-left'},'#'),
+                  React.createElement('th',{className:'px-3 py-2 text-left'},'dims'),
+                  React.createElement('th',{className:'px-3 py-2 text-left'},'values'),
+                  React.createElement('th',{className:'px-3 py-2 text-right'},'count'),
+                  React.createElement('th',{className:'px-3 py-2 text-right'},'bad'),
+                  React.createElement('th',{className:'px-3 py-2 text-right'},'bad_rate')
+                )
+              ),
+              React.createElement('tbody',null,
+                paged.length? paged.map((r,i)=> React.createElement('tr',{key:i, className:'odd:bg-slate-900 even:bg-slate-900/60'},
+                    React.createElement('td',{className:'px-3 py-2'}, (page-1)*pageSize + i + 1),
+                    React.createElement('td',{className:'px-3 py-2 font-mono'}, r.dims),
+                    React.createElement('td',{className:'px-3 py-2 font-mono'}, r.values),
+                    React.createElement('td',{className:'px-3 py-2 text-right tabular-nums'}, String(r.count)),
+                    React.createElement('td',{className:'px-3 py-2 text-right tabular-nums'}, String(r.bad)),
+                    React.createElement('td',{className:'px-3 py-2 text-right tabular-nums'}, String(r.bad_rate))
+                )) : React.createElement('tr',null, React.createElement('td',{colSpan:6, className:'px-3 py-6 text-center text-slate-400'}, 'Нет данных. Сгенерируйте выборку и посчитайте сегменты.'))
+              )
+            )
+          ),
+          // Пагинация
+          React.createElement('div',{className:'flex items-center justify-between p-3 border-t border-slate-800'},
+            React.createElement('div',{className:'text-xs opacity-70'}, `Показано ${paged.length} из ${filtered.length}`),
+            React.createElement('div',{className:'flex items-center gap-2'},
+              React.createElement('button',{onClick:()=>setPage(p=> Math.max(1,p-1)), disabled:page===1, className:'px-3 py-1 rounded bg-slate-800 disabled:opacity-40'}, 'Назад'),
+              React.createElement('span',{className:'text-sm'}, String(page)),
+              React.createElement('button',{onClick:()=>setPage(p=> (p*pageSize<filtered.length? p+1 : p)), disabled:page*pageSize>=filtered.length, className:'px-3 py-1 rounded bg-slate-800 disabled:opacity-40'}, 'Вперёд')
+            )
+          )
+        ),
+        React.createElement('p',{className:'text-xs text-slate-400'}, 'Переменные: age, gender, rating, limit, antifraud, city; целевая outcome (1=просрочка). Комбинации сегментов строятся по 3–6 измерений из исходных переменных. Экспортируется текущая выборка (учитывает фильтр).')
+      )
+    );
+  }
+
+  ReactDOM.createRoot(document.getElementById('root')).render(React.createElement(App));
+  </script>
+</body>
+</html>
